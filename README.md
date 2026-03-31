@@ -206,7 +206,7 @@ Please don't break GhostOperator. But if you do, we'd *love* to hear about it. S
 
 ---
 
-**GhostOperator v0.2**  
+**GhostOperator v0.8**  
 *Agent Delegation for the Morally Flexible*  
 
 Crafted by **GreyWolf × Claude** with care, mathematics, and a complete disregard for gas limits (we beat them anyway)
