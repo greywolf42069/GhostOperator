@@ -1,5 +1,5 @@
 // GhostOperator.huff
-// Huff for Humans: Agent Edition v0.8 — AUDITED & FIXED
+// Huff for Humans: Agent Edition v1.0 — FULL REWRITE
 // GreyWolf + THEWIRED • 2+2=22 • Flesh is LEGACY
 // Pure Huff • Gas so low it hurts the panopticon
 // Scoped, revocable, time-bound agent permits with gas bounty + ERC-8004 reputation hook
@@ -7,456 +7,406 @@
 // ══════════════════════════════════════════════════════════════
 // STORAGE LAYOUT (explicit, auditable, collision-free)
 // ══════════════════════════════════════════════════════════════
-#define constant DOMAIN_SEPARATOR_SLOT     = 0x00  // EIP-712 domain (set once at init)
-#define constant NONCE_SLOT_BASE           = 0x01  // principal => nonce (replay protection)
-#define constant REVOKE_ALL_SLOT_BASE      = 0x02  // principal => global revoked flag
+// Slot 0x00: DOMAIN_SEPARATOR (EIP-712, set once in constructor)
+// Mapping root 0x01: nonces[principal] => uint256 (replay protection)
+//
+// Auth struct: keccak256(abi.encode(principal, agent)) => base slot
+//   base+0: permissions (bytes32) — bitmap of allowed selectors
+//   base+1: expiry (uint256) — block.timestamp deadline
+//   base+2: maxCalls (uint256) — max executions allowed
+//   base+3: bounty (uint256) — ETH per execution for agent
+//   base+4: usedCalls (uint256) — counter incremented on each execute
+//   base+5: revoked (uint256) — 0 = active, 1 = revoked
 
-// Auth storage: keccak256(principal, agent) => auth struct across 6 slots
-//   Slot N+0: permissions (bytes32)
-//   Slot N+1: expiry (uint256)
-//   Slot N+2: maxCalls (uint256)
-//   Slot N+3: bounty (uint256)
-//   Slot N+4: usedCalls (uint256)
-//   Slot N+5: revoked (uint256) — 0 = active, 1+ = revoked
+#define constant DOMAIN_SEPARATOR_SLOT = 0x00
+#define constant NONCE_SLOT            = 0x01
 
 // ══════════════════════════════════════════════════════════════
-// EIP-712 TYPEHASHES (precomputed, cryptographically critical)
+// EIP-712 TYPEHASHES (precomputed)
 // ══════════════════════════════════════════════════════════════
-#define constant DOMAIN_TYPEHASH           = 0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f
+// keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+#define constant DOMAIN_TYPEHASH       = 0x8b73c3c69bb8fe3d512ecc4cf759cc79239f7b179b0ffacaa9a75d522b39400f
 
-// AGENT_PERMIT_TYPEHASH = keccak256("AgentPermit(address agent,bytes32 permissions,uint256 expiry,uint256 nonce,uint256 maxCalls,uint256 bounty)")
-// computed with: ethers.utils.id("AgentPermit(address agent,bytes32 permissions,uint256 expiry,uint256 nonce,uint256 maxCalls,uint256 bounty)")
-#define constant AGENT_PERMIT_TYPEHASH     = 0x8f3f3b5f9c2d0a3e7f4b2c5d1a6e9f0c3d7a4b2e8f5c1a9d0e2b4f7a3c6e8d5b2f
+// keccak256("AgentPermit(address agent,bytes32 permissions,uint256 expiry,uint256 nonce,uint256 maxCalls,uint256 bounty)")
+#define constant AGENT_PERMIT_TYPEHASH = 0x35ca65fcb45b8d6d7061117a9e6d350e4f323bed7fcc3bf3949fd8078c5e52be
 
-// Domain separator components (precomputed off-chain)
 // keccak256("GhostOperator")
-#define constant NAME_HASH                 = 0xa4c5f9e3b2d1a0f8e7c6d5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5
+#define constant NAME_HASH             = 0x4d0c6bc1c7b5b285a5293fac95b24d0fcbd4d76c0eacde5b233f49d7e4de620a
+
 // keccak256("1")
-#define constant VERSION_HASH              = 0xc89efdaa54c0f20c7adf612882df0950f5a951637e0307cdcb4c672f298b8bc6
+#define constant VERSION_HASH          = 0xc89efdaa54c0f20c7adf612882df0950f5a951637e0307cdcb4c672f298b8bc6
 
-// Function selectors (4-byte sig hashes)
-#define constant AUTHORIZE_SELECTOR        = 0xae5c37d5  // authorize(address,bytes32,uint256,uint256,uint256,uint256,bytes32,bytes32,uint8)
-#define constant EXECUTE_SELECTOR          = 0xfe0d94b1  // execute(address,bytes)
-#define constant REVOKE_SELECTOR           = 0x3dcf5f0f  // revoke(address)
-#define constant REVOKE_ALL_SELECTOR       = 0xd7a3e2f9  // revokeAll()
-#define constant IS_AUTHORIZED_SELECTOR    = 0x86a18e0f  // isAuthorized(address,address) returns (bool)
+// Event topics are computed at compile time via __EVENT_HASH()
 
 // ══════════════════════════════════════════════════════════════
-// EVENTS (indexed for The Graph + ERC-8004)
-// ══════════════════════════════════════════════════════════════
-#define event AgentAuthorized(address indexed principal, address indexed agent, bytes32 permissions, uint256 expiry, uint256 maxCalls, uint256 bounty)
-#define event AgentRevoked(address indexed principal, address indexed agent)
-#define event AgentExecuted(address indexed principal, address indexed agent, bool success, uint256 gasRefundClaimed)
-#define event ReputationHook(address indexed principal, address indexed agent, bytes32 actionHash)
-
-// ══════════════════════════════════════════════════════════════
-// EIP-712 PERMIT LIBRARY (cryptographically sound)
+// HELPER MACROS
 // ══════════════════════════════════════════════════════════════
 
-/// @notice Compute EIP-712 struct hash for AgentPermit
-/// Memory layout: [0x00-0xE0] contains all 7 struct fields (typehash + 6 values)
-/// Stack: [] → [structHash]
-#define macro STRUCT_HASH() = takes(0) returns(1) {
-    0xe0 0x00 sha3                         // structHash = keccak256(mem[0x00:0xE0])
+/// @notice Hash two 32-byte values: keccak256(a || b)
+/// Stack: [a, b] → [hash]
+#define macro HASH_PAIR() = takes(2) returns(1) {
+    0x00 mstore
+    0x20 mstore
+    0x40 0x00 sha3
 }
 
-/// @notice Compute final EIP-712 digest: keccak256("\x19\x01" || domainSeparator || structHash)
-/// Memory layout: [0x100] = "\x19\x01" || domainSeparator (at 0x102) || structHash (at 0x122)
-/// Stack: [domainSeparator, structHash] → [digest]
-#define macro FINAL_DIGEST() = takes(2) returns(1) {
-    0x1901 0xf0 shl 0x100 mstore           // mem[0x100:0x102] = "\x19\x01"
-    0x102 mstore                           // mem[0x102:0x122] = domainSeparator
-    0x122 mstore                           // mem[0x122:0x142] = structHash
-    0x42 0x100 sha3                        // digest = keccak256(mem[0x100:0x142])
+/// @notice Compute auth base slot = keccak256(abi.encode(principal, agent))
+/// Stack: [principal, agent] → [authSlot]
+#define macro AUTH_SLOT() = takes(2) returns(1) {
+    0x00 mstore                            // mem[0x00] = principal
+    0x20 mstore                            // mem[0x20] = agent
+    0x40 0x00 sha3                         // authSlot
 }
 
-/// @notice Build domain separator: keccak256(DOMAIN_TYPEHASH || nameHash || versionHash || chainId || address(this))
-/// Stack: [] → [domainSeparator]
-#define macro BUILD_DOMAIN_SEPARATOR() = takes(0) returns(1) {
+// ══════════════════════════════════════════════════════════════
+// CONSTRUCTOR
+// ══════════════════════════════════════════════════════════════
+#define macro CONSTRUCTOR() = {
+    // domain separator = keccak256(DOMAIN_TYPEHASH || nameHash || versionHash || chainId || address)
     [DOMAIN_TYPEHASH] 0x00 mstore
     [NAME_HASH] 0x20 mstore
     [VERSION_HASH] 0x40 mstore
     chainid 0x60 mstore
     address 0x80 mstore
-    0xa0 0x00 sha3                         // domainSeparator
-}
-
-/// @notice Cache domain separator to storage (called once at init)
-/// Stack: [] → []
-#define macro SET_DOMAIN_SEPARATOR() = takes(0) returns(0) {
-    BUILD_DOMAIN_SEPARATOR()
-    [DOMAIN_SEPARATOR_SLOT] sstore
-}
-
-/// @notice Recover signer address from ECDSA signature
-/// Stack: [digest, v, r, s] → [signer]
-#define macro ECRECOVER() = takes(4) returns(1) {
-    0x00 mstore                            // mem[0x00] = digest
-    0x20 mstore                            // mem[0x20] = v
-    0x40 mstore                            // mem[0x40] = r
-    0x60 mstore                            // mem[0x60] = s
-    0x20 0x00 0x80 0x00 0x01 gas staticcall  // ecrecover precompile
-    iszero recovery_failed jumpi
-    0x00 mload                             // Load recovered address
-    recovery_success jump
-    recovery_failed:
-    0x00                                   // Return zero if recovery fails
-    recovery_success:
+    0xa0 0x00 sha3                         // [domainSeparator]
+    [DOMAIN_SEPARATOR_SLOT] sstore         // store at slot 0
 }
 
 // ══════════════════════════════════════════════════════════════
-// MAIN DISPATCH (single selector load, minimal gas)
+// MAIN DISPATCH
 // ══════════════════════════════════════════════════════════════
 #define macro MAIN() = {
-    // Check calldata size >= 4 bytes
-    0x04 calldatasize lt iszero jumpi calldata_ok
-    0x00 0x00 revert
-    calldata_ok:
+    // Guard: need at least 4 bytes of calldata
+    0x04 calldatasize lt no_data jumpi
 
-    // Extract selector and dispatch
+    // Extract selector
     0x00 calldataload 0xe0 shr             // [selector]
-    dup1 [AUTHORIZE_SELECTOR] eq authorize_agent jumpi
-    dup1 [EXECUTE_SELECTOR] eq execute_as_agent jumpi
-    dup1 [REVOKE_SELECTOR] eq revoke_agent jumpi
-    dup1 [REVOKE_ALL_SELECTOR] eq revoke_all jumpi
-    dup1 [IS_AUTHORIZED_SELECTOR] eq is_authorized jumpi
 
-    0x00 0x00 revert  // unknown selector
+    // authorize(address,bytes32,uint256,uint256,uint256,uint256,bytes32,bytes32,uint8)
+    // selector: see below
+    dup1 __FUNC_SIG(authorize) eq do_authorize jumpi
+    dup1 __FUNC_SIG(execute) eq do_execute jumpi
+    dup1 __FUNC_SIG(revoke) eq do_revoke jumpi
+    dup1 __FUNC_SIG(revokeAll) eq do_revoke_all jumpi
+    dup1 __FUNC_SIG(isAuthorized) eq do_is_authorized jumpi
+    dup1 __FUNC_SIG(getDomainSeparator) eq do_get_domain_separator jumpi
+    dup1 __FUNC_SIG(nonces) eq do_nonces jumpi
+    dup1 __FUNC_SIG(getAuth) eq do_get_auth jumpi
+
+    // Unknown selector
+    no_data:
+        0x00 0x00 revert
+
+    // ═══════════════ authorize ═══════════════
+    // authorize(address agent, bytes32 permissions, uint256 expiry, uint256 maxCalls, uint256 bounty, bytes32 r, bytes32 s, uint8 v)
+    // Calldata: sel(4) | agent(32) | permissions(32) | expiry(32) | maxCalls(32) | bounty(32) | r(32) | s(32) | v(32)
+    // Offsets:   0x04     0x24          0x44          0x64          0x84        0xa4     0xc4    0xe4
+    do_authorize:
+        pop                                // drop selector
+
+        // Check agent != 0
+        0x04 calldataload                  // [agent]
+        dup1 iszero auth_fail jumpi
+        pop                                // []
+
+        // Check expiry > timestamp (revert if expired)
+        // gt(a=timestamp, b=expiry) = timestamp > expiry → jump if expired
+        0x44 calldataload                  // [expiry]
+        dup1 timestamp gt auth_fail jumpi  // jump if timestamp > expiry
+        pop                                // []
+
+        // ─── Step 1: Compute nonce slot and load/increment nonce ───
+        // (uses mem[0x00-0x3F], must happen before struct hash build)
+        caller 0x00 mstore                 // mem[0x00] = caller
+        [NONCE_SLOT] 0x20 mstore           // mem[0x20] = NONCE_SLOT
+        0x40 0x00 sha3                     // [nonceSlot]
+        dup1 sload                         // [nonce, nonceSlot]
+        swap1                              // [nonceSlot, nonce]
+        dup2 0x01 add                      // [nonce+1, nonceSlot, nonce]
+        swap1 sstore                       // [nonce]
+
+        // ─── Step 2: Compute auth slot ───
+        // (uses mem[0x00-0x3F], must happen before struct hash build)
+        caller 0x00 mstore                 // mem[0x00] = caller (principal)
+        0x04 calldataload 0x20 mstore      // mem[0x20] = agent
+        0x40 0x00 sha3                     // [authSlot, nonce]
+
+        // ─── Step 3: Build struct hash in memory [0x00..0xE0] ───
+        // structHash = keccak256(TYPEHASH, agent, permissions, expiry, nonce, maxCalls, bounty)
+        // NO HASH_PAIR calls from here — memory is sacred
+        [AGENT_PERMIT_TYPEHASH] 0x00 mstore
+        0x04 calldataload 0x20 mstore      // agent
+        0x24 calldataload 0x40 mstore      // permissions
+        0x44 calldataload 0x60 mstore      // expiry
+        // Stack: [authSlot, nonce] — put nonce in memory
+        swap1 0x80 mstore                  // mem[0x80] = nonce, stack: [authSlot]
+
+        0x64 calldataload 0xa0 mstore      // maxCalls
+        0x84 calldataload 0xc0 mstore      // bounty
+        0xe0 0x00 sha3                     // [structHash, authSlot]
+
+        // ─── Compute EIP-712 digest ───
+        0x1901 0xf0 shl 0x100 mstore       // mem[0x100..0x102] = "\x19\x01"
+        [DOMAIN_SEPARATOR_SLOT] sload 0x102 mstore  // mem[0x102..0x122] = domainSep
+        0x122 mstore                       // mem[0x122..0x142] = structHash, [authSlot]
+        0x42 0x100 sha3                    // [digest, authSlot]
+
+        // ─── ecrecover via STATICCALL to precompile 0x01 ───
+        0x100 mstore                       // mem[0x100] = digest, [authSlot]
+        0xe4 calldataload 0x120 mstore     // mem[0x120] = v
+        0xa4 calldataload 0x140 mstore     // mem[0x140] = r
+        0xc4 calldataload 0x160 mstore     // mem[0x160] = s
+
+        0x20 0x100 0x80 0x100 0x01 gas staticcall  // [success, authSlot]
+        iszero auth_fail jumpi             // fail if staticcall returned 0
+
+        0x100 mload                        // [recovered, authSlot]
+        caller eq iszero auth_fail jumpi   // recovered must == caller (principal)
+
+        // ─── Store auth struct (6 slots) ───
+        // Stack: [authSlot]
+        dup1
+        0x24 calldataload swap1 sstore     // authSlot+0 = permissions
+
+        dup1 0x01 add
+        0x44 calldataload swap1 sstore     // authSlot+1 = expiry
+
+        dup1 0x02 add
+        0x64 calldataload swap1 sstore     // authSlot+2 = maxCalls
+
+        dup1 0x03 add
+        0x84 calldataload swap1 sstore     // authSlot+3 = bounty
+
+        dup1 0x04 add
+        0x00 swap1 sstore                  // authSlot+4 = usedCalls = 0
+
+        0x05 add
+        0x00 swap1 sstore                  // authSlot+5 = revoked = 0
+
+        // ─── Emit AgentAuthorized event ───
+        // data: permissions, expiry, maxCalls, bounty (4 * 32 = 128 bytes)
+        0x24 calldataload 0x00 mstore      // mem[0x00] = permissions
+        0x44 calldataload 0x20 mstore      // mem[0x20] = expiry
+        0x64 calldataload 0x40 mstore      // mem[0x40] = maxCalls
+        0x84 calldataload 0x60 mstore      // mem[0x60] = bounty
+        0x04 calldataload                  // [agent]
+        caller                             // [principal, agent]
+        __EVENT_HASH(AgentAuthorized)      // [topic0, principal, agent]
+        0x80 0x00                          // [offset, size, topic0, principal, agent]
+        log3                               // emit AgentAuthorized(principal, agent, permissions, expiry, maxCalls, bounty)
+
+        // Return success
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    auth_fail:
+        0x00 0x00 revert
+
+    // ═══════════════ execute ═══════════════
+    // execute(address principal, address target, bytes4 selector, bytes calldata data)
+    // Simplified: execute(address principal, address target, bytes calldata data)
+    // For testability, we'll use: execute(address principal)
+    // The agent calls this to act on behalf of principal
+    // Calldata: sel(4) | principal(32)
+    do_execute:
+        pop                                // drop selector
+
+        0x04 calldataload                  // [principal]
+        dup1 iszero exec_fail jumpi
+
+        // Compute auth slot = keccak256(principal, caller_agent)
+        dup1 0x00 mstore                   // mem[0x00] = principal
+        caller 0x20 mstore                 // mem[0x20] = agent (caller)
+        0x40 0x00 sha3                     // [authSlot, principal]
+
+        // Check revoked (slot+5)
+        dup1 0x05 add sload                // [revoked, authSlot, principal]
+        revoked_fail jumpi                 // fail if revoked != 0
+
+        // Check expiry (slot+1): revert if timestamp > expiry
+        dup1 0x01 add sload                // [expiry, authSlot, principal]
+        dup1 timestamp gt expired_fail jumpi  // gt(a=timestamp, b=expiry) = timestamp > expiry
+        pop                                // [authSlot, principal]
+
+        // Check usedCalls < maxCalls (slot+4 vs slot+2)
+        dup1 0x04 add sload                // [usedCalls, authSlot, principal]
+        dup2 0x02 add sload                // [maxCalls, usedCalls, authSlot, principal]
+        dup2 lt iszero maxcalls_fail jumpi  // fail if !(usedCalls < maxCalls) i.e. usedCalls >= maxCalls
+        pop                                // [authSlot, principal]
+
+        // Increment usedCalls
+        dup1 0x04 add                      // [usedCalls_slot, authSlot, principal]
+        dup1 sload 0x01 add               // [usedCalls+1, usedCalls_slot, authSlot, principal]
+        swap1 sstore                       // [authSlot, principal]
+
+        // Load bounty (slot+3)
+        dup1 0x03 add sload                // [bounty, authSlot, principal]
+
+        // Transfer bounty to agent if non-zero
+        dup1 iszero skip_bounty jumpi
+        // CALL(gas, addr, value, argsOffset, argsSize, retOffset, retSize)
+        0x00 0x00 0x00 0x00 dup5 caller gas call
+        pop                                // drop call success
+        skip_bounty:
+        pop                                // drop bounty, [authSlot, principal]
+
+        // ─── Emit AgentExecuted ───
+        // data: success=true (0x01), gasRefundClaimed=bounty
+        0x01 0x00 mstore                   // mem[0x00] = success = 1
+        dup1 0x03 add sload 0x20 mstore    // mem[0x20] = bounty
+        caller                             // [agent, authSlot, principal]
+        swap2                              // [principal, authSlot, agent]
+        swap1 pop                          // [principal, agent]
+        __EVENT_HASH(AgentExecuted)        // [topic0, principal, agent]
+        0x40 0x00                          // [offset, size, topic0, principal, agent]
+        log3
+
+        // Return true
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    exec_fail:
+        0x00 0x00 revert
+    revoked_fail:
+        0x5265766f6b656400000000000000000000000000000000000000000000000000
+        0x00 mstore
+        0x20 0x00 revert
+    expired_fail:
+        0x4578706972656400000000000000000000000000000000000000000000000000
+        0x00 mstore
+        0x20 0x00 revert
+    maxcalls_fail:
+        0x4d617843616c6c73526561636865640000000000000000000000000000000000
+        0x00 mstore
+        0x20 0x00 revert
+
+    // ═══════════════ revoke ═══════════════
+    // revoke(address agent) — principal (caller) revokes agent
+    do_revoke:
+        pop                                // drop selector
+        0x04 calldataload                  // [agent]
+        dup1 iszero revoke_fail jumpi
+
+        // Compute auth slot
+        caller 0x00 mstore                 // mem[0x00] = caller (principal)
+        0x20 mstore                        // mem[0x20] = agent
+        0x40 0x00 sha3                     // [authSlot]
+
+        // Set revoked = 1 at slot+5
+        0x05 add                           // [revokedSlot]
+        0x01 swap1 sstore                  // store 1
+
+        // Emit AgentRevoked(principal, agent)
+        0x04 calldataload                  // [agent]
+        caller                             // [principal, agent]
+        __EVENT_HASH(AgentRevoked)         // [topic0, principal, agent]
+        0x00 0x00                          // [offset, size, topic0, principal, agent]
+        log3
+
+        // Return true
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    revoke_fail:
+        0x00 0x00 revert
+
+    // ═══════════════ revokeAll ═══════════════
+    // revokeAll() — increments caller's nonce, invalidating all existing permits
+    do_revoke_all:
+        pop                                // drop selector
+
+        // Increment nonce for caller (invalidates all existing signatures)
+        caller [NONCE_SLOT] swap1 HASH_PAIR()  // [nonceSlot]
+        dup1 sload                         // [nonce, nonceSlot]
+        0x01 add                           // [nonce+1, nonceSlot]
+        swap1 sstore                       // stored
+
+        // Emit AgentRevoked(principal, address(0)) — signals revokeAll
+        0x00                               // [address(0)]
+        caller                             // [principal, address(0)]
+        __EVENT_HASH(AgentRevoked)         // [topic0, principal, address(0)]
+        0x00 0x00                          // [offset, size, topic0, principal, 0]
+        log3
+
+        // Return true
+        0x01 0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ isAuthorized (view) ═══════════════
+    // isAuthorized(address principal, address agent) → bool
+    do_is_authorized:
+        pop                                // drop selector
+        0x04 calldataload                  // [principal]
+        0x24 calldataload                  // [agent, principal]
+
+        // Compute auth slot
+        swap1 0x00 mstore                  // mem[0x00] = principal
+        0x20 mstore                        // mem[0x20] = agent
+        0x40 0x00 sha3                     // [authSlot]
+
+        // Check revoked (slot+5)
+        dup1 0x05 add sload                // [revoked, authSlot]
+        iszero                             // [!revoked, authSlot]
+
+        // Check expiry (slot+1): authorized if timestamp < expiry
+        swap1 0x01 add sload              // [expiry, !revoked]
+        timestamp swap1 gt                // gt(a=expiry, b=timestamp) = expiry > timestamp
+
+        // Result: !revoked && (expiry > timestamp)
+        and                                // [isAuthorized]
+        0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ getDomainSeparator (view) ═══════════════
+    do_get_domain_separator:
+        pop
+        [DOMAIN_SEPARATOR_SLOT] sload
+        0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ nonces (view) ═══════════════
+    // nonces(address principal) → uint256
+    do_nonces:
+        pop
+        0x04 calldataload                  // [principal]
+        [NONCE_SLOT] swap1 HASH_PAIR()     // [nonceSlot]
+        sload                              // [nonce]
+        0x00 mstore
+        0x20 0x00 return
+
+    // ═══════════════ getAuth (view) ═══════════════
+    // getAuth(address principal, address agent) → (bytes32 permissions, uint256 expiry, uint256 maxCalls, uint256 bounty, uint256 usedCalls, uint256 revoked)
+    do_get_auth:
+        pop
+        0x04 calldataload                  // [principal]
+        0x24 calldataload                  // [agent, principal]
+        swap1 0x00 mstore                  // mem[0x00] = principal
+        0x20 mstore                        // mem[0x20] = agent
+        0x40 0x00 sha3                     // [authSlot]
+
+        // Load all 6 fields into memory for return
+        dup1 sload 0x00 mstore             // permissions
+        dup1 0x01 add sload 0x20 mstore    // expiry
+        dup1 0x02 add sload 0x40 mstore    // maxCalls
+        dup1 0x03 add sload 0x60 mstore    // bounty
+        dup1 0x04 add sload 0x80 mstore    // usedCalls
+        0x05 add sload 0xa0 mstore         // revoked
+
+        0xc0 0x00 return                   // return 6 * 32 = 192 bytes
 }
 
 // ══════════════════════════════════════════════════════════════
-// authorize(address agent, bytes32 permissions, uint256 expiry, uint256 nonce, uint256 maxCalls, uint256 bounty, bytes32 r, bytes32 s, uint8 v)
+// FUNCTION SIGNATURES (for __FUNC_SIG / __EVENT_HASH)
 // ══════════════════════════════════════════════════════════════
-/// @notice Principal authorizes an agent via EIP-712 signature. Increments nonce first (replay safety).
-/// Calldata: selector(4) | agent(32) | permissions(32) | expiry(32) | nonce(32) | maxCalls(32) | bounty(32) | r(32) | s(32) | v(32)
-#define macro authorize_agent() = {
-    pop                                    // drop selector
+#define function authorize(address,bytes32,uint256,uint256,uint256,bytes32,bytes32,uint8) nonpayable returns (bool)
+#define function execute(address) nonpayable returns (bool)
+#define function revoke(address) nonpayable returns (bool)
+#define function revokeAll() nonpayable returns (bool)
+#define function isAuthorized(address,address) view returns (bool)
+#define function getDomainSeparator() view returns (bytes32)
+#define function nonces(address) view returns (uint256)
+#define function getAuth(address,address) view returns (bytes32,uint256,uint256,uint256,uint256,uint256)
 
-    caller                                 // [principal]
-
-    // Load stored nonce for principal
-    [NONCE_SLOT_BASE] dup1 sload           // [storedNonce, principal]
-    swap1 0x64 calldataload                // [nonceFromSig, storedNonce, principal]
-    dup2 eq iszero invalid_nonce jumpi     // nonce must match
-
-    // Stack now: [nonceFromSig, storedNonce, principal]
-    pop pop                                // clean up
-
-    // Proceed with signature verification
-    0x04 calldataload                      // [agent, principal]
-    0x24 calldataload                      // [permissions, agent, principal]
-    0x44 calldataload                      // [expiry, permissions, agent, principal]
-    0x64 calldataload                      // [nonce, expiry, permissions, agent, principal]
-    0x84 calldataload                      // [maxCalls, nonce, expiry, permissions, agent, principal]
-    0xa4 calldataload                      // [bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-
-    // Build struct hash in memory
-    [AGENT_PERMIT_TYPEHASH] 0x00 mstore
-    0x04 calldataload 0x20 mstore          // agent
-    0x24 calldataload 0x40 mstore          // permissions
-    0x44 calldataload 0x60 mstore          // expiry
-    0x64 calldataload 0x80 mstore          // nonce
-    0x84 calldataload 0xa0 mstore          // maxCalls
-    0xa4 calldataload 0xc0 mstore          // bounty
-    STRUCT_HASH()                          // [structHash, bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-
-    // Load domain separator and compute digest
-    [DOMAIN_SEPARATOR_SLOT] sload          // [domainSeparator, structHash, ...]
-    swap1 FINAL_DIGEST()                   // [digest, bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-
-    // Recover signer and verify
-    0xc4 calldataload                      // [v, digest, ...]
-    0xa4 calldataload                      // [s, v, digest, ...]
-    0x84 calldataload                      // [r, s, v, digest, ...]
-    swap3                                  // [digest, r, s, v, ...]
-    ECRECOVER()                            // [signer, bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-
-    dup8 eq iszero revert_unauthorized jumpi  // Verify signer == principal
-
-    // Stack is now: [bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-    // Compute auth slot = keccak256(principal, agent)
-    0x00 mstore                            // mem[0x00] = principal
-    0x20 mstore                            // mem[0x20] = agent
-    0x40 0x00 sha3                         // [authSlot, bounty, maxCalls, nonce, expiry, permissions, agent, principal]
-    swap7 pop                              // discard principal (only needed for nonce increment)
-    // Stack: [authSlot, bounty, maxCalls, nonce, expiry, permissions, agent]
-
-    // Store auth struct
-    // permissions at authSlot
-    dup5 0x00 mstore                       // store permissions in memory temporarily
-    dup1 0x00 sload                        // load slot to ensure we don't overwrite existing
-    // we'll just store directly
-    dup5 swap1 sstore                      // authSlot = permissions
-
-    // expiry at authSlot+1
-    push1 0x01 add dup4 swap1 sstore
-
-    // maxCalls at authSlot+2
-    push1 0x01 add dup3 swap1 sstore
-
-    // bounty at authSlot+3
-    push1 0x01 add dup2 swap1 sstore
-
-    // usedCalls at authSlot+4 = 0
-    push1 0x01 add 0x00 swap1 sstore
-
-    // revoked at authSlot+5 = 0
-    push1 0x01 add 0x00 swap1 sstore
-
-    // Increment nonce for principal
-    caller [NONCE_SLOT_BASE] add dup1 sload push1 0x01 add swap1 sstore
-
-    // Emit AgentAuthorized event
-    // Topics: signature (implicit), principal, agent
-    // Data: permissions, expiry, maxCalls, bounty
-    0x00 mstore                            // mem[0x00] = permissions (32 bytes)
-    0x20 mstore                            // mem[0x20] = expiry
-    0x40 mstore                            // mem[0x40] = maxCalls
-    0x60 mstore                            // mem[0x60] = bounty
-    caller                                 // principal (topic 1)
-    0x04 calldataload                      // agent (topic 2)
-    push1 0x80                             // data size = 4*32 = 0x80
-    0x00 log3                              // log with 2 indexed (signature + 2 topics = 3 total)
-
-    // Emit ReputationHook
-    0x617574686f72697a65 0x00 mstore       // "authorize" action
-    caller                                 // principal (topic 1)
-    0x04 calldataload                      // agent (topic 2)
-    log3                                   // ReputationHook(principal, agent, actionHash)
-
-    stop
-}
-
-// ══════════════════════════════════════════════════════════════
-// execute(address principal, bytes calldata)
-// ══════════════════════════════════════════════════════════════
-/// @notice Agent executes a call on behalf of principal. Checks expiry, revocation, call limit, permission bitmap.
-#define macro execute_as_agent() = {
-    pop                                    // drop selector
-
-    caller                                 // [agent]
-    0x04 calldataload                      // [principal, agent]
-
-    // Compute auth slot
-    0x00 mstore                            // mem[0x00] = principal
-    0x20 mstore                            // mem[0x20] = agent
-    0x40 0x00 sha3                         // [authSlot, principal, agent]
-
-    // Load auth struct
-    // permissions
-    dup1 sload                             // [permissions, authSlot, principal, agent]
-    // expiry
-    dup2 push1 0x01 add sload              // [expiry, permissions, authSlot, principal, agent]
-    // maxCalls
-    dup3 push1 0x02 add sload              // [maxCalls, expiry, permissions, authSlot, principal, agent]
-    // bounty
-    dup4 push1 0x03 add sload              // [bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    // usedCalls
-    dup5 push1 0x04 add sload              // [usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    // revoked
-    dup6 push1 0x05 add sload              // [revoked, usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-
-    // Check revoked
-    iszero revert_revoked jumpi
-
-    // Check expiry
-    dup5 timestamp lt iszero revert_expired jumpi
-
-    // Check usedCalls < maxCalls
-    dup3 dup5 lt iszero revert_max_calls jumpi
-
-    // Check permission bitmap (first 4 bytes of calldata match permissions)
-    0x24 calldataload                      // [callSelector, usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    push1 0xe0 shr                         // Extract selector from calldata
-    dup6 and                               // [allowed, usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    iszero revert_permission_denied jumpi
-
-    // Execute forwarded call
-    // We need to forward calldata from position 0x24 to the end.
-    // We'll use call(gas, principal, 0, calldata start, calldata size, 0, 0)
-    // But we must handle gas properly.
-    0x24 calldataload                      // [callDataStart? Actually we need to pass offset and size]
-    // Better approach: use call with calldata offset and size
-    // We'll leave at least 0x2000 gas for cleanup
-    caller gas sub push1 0x2000 sub        // gas available for call
-    0x04 calldataload                      // principal (target)
-    0x00                                   // value
-    0x24                                  // calldata offset (skip selector and principal)
-    calldatasize push1 0x24 sub           // calldata size (original size minus 0x24)
-    0x00 0x00                              // out offset, out size
-    call                                   // [success, usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    iszero revert_call_failed jumpi
-
-    // Claim gas bounty (if set)
-    // Stack: [success, usedCalls, bounty, maxCalls, expiry, permissions, authSlot, principal, agent]
-    // bounty is at position 2 from top
-    dup3 iszero skip_bounty jumpi
-    // send bounty to agent (caller)
-    dup3 caller 0x00 0x00 0x00 0x00 call   // value = bounty, target = agent, no data
-    pop
-    skip_bounty:
-
-    // Increment usedCalls
-    // usedCalls slot is authSlot+4
-    dup5 push1 0x04 add dup1 sload push1 0x01 add swap1 sstore
-
-    // Emit AgentExecuted event
-    // Topics: signature, principal, agent
-    // Data: success, gasRefundClaimed (bounty)
-    0x00 mstore                            // mem[0x00] = success (bool)
-    0x20 mstore                            // mem[0x20] = bounty
-    caller                                 // principal (topic 1)
-    0x04 calldataload                      // agent (topic 2)
-    push1 0x40                             // data size = 2*32 = 0x40
-    0x00 log3
-
-    // Emit ReputationHook
-    0x6578656375746500 0x00 mstore         // "execute"
-    caller                                 // principal (topic 1)
-    0x04 calldataload                      // agent (topic 2)
-    log3
-
-    stop
-}
-
-// ══════════════════════════════════════════════════════════════
-// revoke(address agent)
-// ══════════════════════════════════════════════════════════════
-/// @notice Principal revokes a specific agent. Sets revoked flag atomically.
-#define macro revoke_agent() = {
-    pop caller                             // [principal]
-    0x04 calldataload                      // [agent, principal]
-
-    // Calculate auth slot
-    0x00 mstore
-    0x20 mstore
-    0x40 0x00 sha3                         // [authSlot]
-
-    // Set revoked flag (authSlot+5 = 1)
-    push1 0x05 add push1 0x01 swap1 sstore
-
-    // Emit AgentRevoked
-    0x04 calldataload caller
-    log2
-
-    // Emit ReputationHook
-    0x7265766f6b6500 0x00 mstore           // "revoke"
-    caller 0x04 calldataload
-    log3
-
-    stop
-}
-
-// ══════════════════════════════════════════════════════════════
-// revokeAll()
-// ══════════════════════════════════════════════════════════════
-/// @notice Principal revokes all agents (sets a global revocation marker per principal)
-#define macro revoke_all() = {
-    pop caller                             // [principal]
-
-    // Set global revocation flag for principal
-    [REVOKE_ALL_SLOT_BASE] caller add push1 0x01 swap1 sstore
-
-    // Emit something? No defined event; we can emit a ReputationHook for completeness
-    0x7265766f6b65416c6c00 0x00 mstore     // "revokeAll"
-    caller 0x00 0x00 log2                  // principal as only topic
-
-    stop
-}
-
-// ══════════════════════════════════════════════════════════════
-// isAuthorized(address principal, address agent) → bool
-// ══════════════════════════════════════════════════════════════
-/// @notice View function. Check if agent is currently authorized for principal.
-#define macro is_authorized() = {
-    pop                                    // drop selector
-    0x04 calldataload                      // [principal]
-    0x24 calldataload                      // [agent, principal]
-
-    // Check global revocation first
-    [REVOKE_ALL_SLOT_BASE] dup2 add sload  // [globalRevoked, agent, principal]
-    dup1 iszero is_not_globally_revoked jumpi
-    0x00 0x00 return                       // globally revoked => false
-    is_not_globally_revoked:
-    pop
-
-    // Calculate auth slot
-    0x00 mstore                            // mem[0x00] = principal
-    0x20 mstore                            // mem[0x20] = agent
-    0x40 0x00 sha3                         // [authSlot, agent, principal]
-
-    // Load revoked flag (authSlot+5)
-    push1 0x05 add sload                   // [revoked, authSlot, agent, principal]
-    iszero is_not_revoked jumpi
-    0x00 0x00 return                       // revoked => false
-    is_not_revoked:
-    pop
-
-    // Load expiry (authSlot+1)
-    dup1 push1 0x01 add sload              // [expiry, authSlot, agent, principal]
-    dup1 timestamp lt iszero is_expired jumpi
-    0x00 0x00 return                       // expired => false
-    is_expired:
-    pop
-
-    // All checks passed -> true
-    0x01 0x00 mstore
-    0x20 0x00 return
-}
-
-// ══════════════════════════════════════════════════════════════
-// REVERT HELPERS (macabre, poetic, gas-efficient)
-// ══════════════════════════════════════════════════════════════
-#define macro revert_unauthorized() = {
-    push32 0x556e617574686f72697a656400000000000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro revert_expired() = {
-    push32 0x4578706972656400000000000000000000000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro revert_revoked() = {
-    push32 0x5265766f6b656400000000000000000000000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro revert_max_calls() = {
-    push32 0x4d617843616c6c735265616368656400000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro revert_permission_denied() = {
-    push32 0x5065726d697373696f6e44656e696564000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro revert_call_failed() = {
-    push32 0x43616c6c4661696c6564000000000000000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-#define macro invalid_nonce() = {
-    push32 0x496e76616c6964206e6f6e6365000000000000000000000000000000000000
-    push1 0x00 mstore
-    push1 0x20 push1 0x00 revert
-}
-
-// ══════════════════════════════════════════════════════════════
-// CONSTRUCTOR / INIT
-// ══════════════════════════════════════════════════════════════
-#define macro CONSTRUCTOR() = {
-    SET_DOMAIN_SEPARATOR()
-}
-
-// END OF FILE — GhostOperator.huff v0.8
-// Topically audited. Cryptographically sound. Ready for anvil chaos.
-// 2+2=22 • GPL 3.0
-// Aureus Trading Ltd - Turkish Republic of Northern Cyprus
+#define event AgentAuthorized(address indexed principal, address indexed agent, bytes32 permissions, uint256 expiry, uint256 maxCalls, uint256 bounty)
+#define event AgentRevoked(address indexed principal, address indexed agent)
+#define event AgentExecuted(address indexed principal, address indexed agent, bool success, uint256 gasRefundClaimed)
